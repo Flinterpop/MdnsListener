@@ -12,11 +12,17 @@
 // and selects its sender's conversation; selecting a tree line highlights
 // its bytes in the hex dump; clicking a conversation filters the log to it;
 // clicking a chart arrow decodes that packet.
+//
+// Open capture (or a file dropped on the window, or a path on the command
+// line) stops listening and shows the mDNS in a pcap or pcapng file instead.
 #include <winsock2.h>
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
+#include <shellapi.h>
 #include <windowsx.h>
 
+#include "Capture.h"
 #include "Conversations.h"
 #include "Dns.h"
 #include "HexDump.h"
@@ -56,7 +62,11 @@ enum ControlId : int {
     IDC_HEX,
     IDC_TABS,
     IDC_SEQ,
+    IDC_OPEN,
 };
+
+constexpr UINT kMsgOpenPending = WM_APP + 2;   // open the capture named on the command line
+constexpr int kIconId = 1;
 
 struct LogEntry {
     uint64_t seq = 0;
@@ -78,7 +88,7 @@ struct Column {
 struct App {
     HINSTANCE inst = nullptr;
     HWND wnd = nullptr;
-    HWND start = nullptr, pause = nullptr, clear = nullptr, showAll = nullptr, copy = nullptr, autoScroll = nullptr;
+    HWND open = nullptr, start = nullptr, pause = nullptr, clear = nullptr, showAll = nullptr, copy = nullptr, autoScroll = nullptr;
     HWND status = nullptr;
     HWND hdrLog = nullptr, hdrConv = nullptr, hdrDecode = nullptr, hdrHex = nullptr;
     HWND log = nullptr, conv = nullptr, tree = nullptr, hex = nullptr;
@@ -89,6 +99,11 @@ struct App {
     mdns::Listener listener;
     std::string listenStatus;
     std::wstring lastStatus;
+
+    // Showing a capture file rather than listening.
+    bool fromFile = false;
+    std::wstring fileStatus;
+    std::wstring pendingOpen;
 
     // Pause freezes the display, not the capture: packets drained while
     // paused wait here and are added on resume.
@@ -160,6 +175,13 @@ std::wstring Endpoint(const mdns::Packet& p)
     return p.ipv6 ? L"[" + addr + L"]:" + port : addr + L":" + port;
 }
 
+// A capture file names its own interfaces; a live packet's index is looked
+// up in the listener's table.
+std::wstring InterfaceText(const mdns::Packet& p)
+{
+    return Wide(p.ifName.empty() ? g.listener.InterfaceName(p.ifIndex) : p.ifName);
+}
+
 const LogEntry* FindEntry(uint64_t seq)
 {
     if (g.entries.empty() || seq < g.entries.front().seq) {
@@ -222,7 +244,7 @@ void ApplyFonts()
     g.mono = CreateFontW(-MulDiv(9, static_cast<int>(g.dpi), 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
                          FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                          FIXED_PITCH | FF_MODERN, L"Consolas");
-    const HWND uiControls[] = {g.start, g.pause, g.clear, g.showAll, g.copy, g.autoScroll, g.status, g.hdrLog,
+    const HWND uiControls[] = {g.open, g.start, g.pause, g.clear, g.showAll, g.copy, g.autoScroll, g.status, g.hdrLog,
                                g.hdrConv, g.hdrDecode, g.hdrHex, g.log, g.conv, g.tabs, g.seq};
     for (HWND h : uiControls) {
         SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g.ui), TRUE);
@@ -278,7 +300,7 @@ void Layout()
     int x = m;
     const int y = m;
     const struct { HWND h; int w; } bar[] = {
-        {g.start, 80}, {g.pause, 80}, {g.clear, 80}, {g.showAll, 110}, {g.copy, 110}, {g.autoScroll, 100}};
+        {g.open, 105}, {g.start, 80}, {g.pause, 80}, {g.clear, 80}, {g.showAll, 110}, {g.copy, 110}, {g.autoScroll, 100}};
     for (const auto& b : bar) {
         Place(b.h, x, y, Scale(b.w), bh);
         x += Scale(b.w) + m;
@@ -391,7 +413,9 @@ bool Evict()
 void UpdateStatus()
 {
     std::wstring s = Wide(g.listenStatus);
-    if (!g.listener.Running()) {
+    if (g.fromFile) {
+        s = g.fileStatus;
+    } else if (!g.listener.Running()) {
         s = L"Stopped.  " + s;
     }
     s += L"  |  " + std::to_wstring(g.nextSeq - 1) + L" packets, " +
@@ -506,7 +530,7 @@ void LogDispInfo(NMLVDISPINFOW* di)
     case 4: CopyOut(di, std::to_wstring(e->pkt.data.size())); break;
     case 5: CopyOut(di, e->summary); break;
     case 6: CopyOut(di, Wide(e->pkt.destination)); break;
-    default: CopyOut(di, Wide(g.listener.InterfaceName(e->pkt.ifIndex))); break;
+    default: CopyOut(di, InterfaceText(e->pkt)); break;
     }
 }
 
@@ -576,10 +600,10 @@ void AddFrameNodes(const LogEntry& e, std::vector<mdns::Node>& out)
     add(1, L"Arrival: " + TimeText(p.time, true));
     add(1, L"Source: " + Endpoint(p));
     add(1, L"Destination: " + Wide(p.destination) + L" port 5353");
-    add(1, L"Interface: " + Wide(g.listener.InterfaceName(p.ifIndex)) + L" (index " +
-               std::to_wstring(p.ifIndex) + L")");
+    add(1, L"Interface: " + InterfaceText(p) + L" (index " + std::to_wstring(p.ifIndex) + L")");
     if (p.truncated) {
-        add(1, L"Truncated: datagram was larger than the receive buffer");
+        add(1, p.ifName.empty() ? L"Truncated: datagram was larger than the receive buffer"
+                                : L"Truncated: the capture holds only part of the datagram");
     }
 }
 
@@ -835,8 +859,21 @@ void CopyDecode()
 // Commands
 // ---------------------------------------------------------------------------
 
+void ClearAll();
+
+void SetTitle(const std::wstring& file)
+{
+    const std::wstring base = L"MDNS Listener " MDNSL_VERSION_W;
+    SetWindowTextW(g.wnd, file.empty() ? base.c_str() : (base + L"  —  " + file).c_str());
+}
+
 void StartStop()
 {
+    if (!g.listener.Running() && g.fromFile) {   // back to live: the file's packets go
+        g.fromFile = false;
+        ClearAll();
+        SetTitle(std::wstring());
+    }
     if (g.listener.Running()) {
         g.listener.Stop();
         SetWindowTextW(g.start, L"Start");
@@ -871,6 +908,88 @@ void ClearAll()
     UpdateStatus();
 }
 
+std::wstring FileStatus(const std::wstring& name, const mdns::CaptureResult& r)
+{
+    std::wstring s = name + L" (" + Wide(r.format) + L"):  " + std::to_wstring(r.packets.size() + r.overLimit) +
+                     L" mDNS in " + std::to_wstring(r.frames) + L" frames";
+    if (r.overLimit > 0) {
+        s += L", only the first " + std::to_wstring(r.packets.size()) + L" shown";
+    }
+    if (r.fragments > 0) {
+        s += L", " + std::to_wstring(r.fragments) + L" IP fragments skipped";
+    }
+    if (r.unsupportedLink > 0) {
+        s += L", " + std::to_wstring(r.unsupportedLink) + L" on link types not read";
+    }
+    if (!r.warning.empty()) {
+        s += L".  " + Wide(r.warning);
+    }
+    return s;
+}
+
+// Stops listening and shows the mDNS in a capture file instead.
+void OpenCapture(const std::wstring& path)
+{
+    assert(!path.empty());
+    if (g.listener.Running()) {
+        g.listener.Stop();
+    }
+    SetWindowTextW(g.start, L"Start");
+    g.paused = false;
+    Button_SetCheck(g.pause, BST_UNCHECKED);
+    SetWindowTextW(g.pause, L"Pause");
+    g.fromFile = false;
+    ClearAll();
+    mdns::CaptureResult r;
+    std::string error;
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    const bool ok = mdns::ReadCaptureFile(path, kMaxLogEntries, r, error);
+    SetCursor(old);
+    const size_t slash = path.find_last_of(L"\\/");
+    const std::wstring name = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+    if (!ok) {
+        g.listenStatus = "Capture not opened.";
+        UpdateStatus();
+        MessageBoxW(g.wnd, (L"Could not read " + name + L".\r\n\r\n" + Wide(error)).c_str(), L"MDNS Listener",
+                    MB_ICONWARNING);
+        return;
+    }
+    g.fromFile = true;
+    g.fileStatus = FileStatus(name, r);
+    SetTitle(name);
+    IngestBatch(r.packets);
+    if (!g.view.empty()) {
+        ListView_EnsureVisible(g.log, 0, FALSE);
+    }
+}
+
+void ChooseCapture()
+{
+    wchar_t file[MAX_PATH] = {};
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g.wnd;
+    ofn.lpstrFilter = L"Captures (*.pcapng; *.pcap; *.cap)\0*.pcapng;*.pcap;*.cap;*.ntar\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = L"Open capture";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_EXPLORER;
+    if (GetOpenFileNameW(&ofn)) {
+        OpenCapture(file);
+    }
+}
+
+void OnDropFiles(HDROP drop)
+{
+    assert(drop != nullptr);
+    wchar_t file[MAX_PATH] = {};
+    const UINT n = DragQueryFileW(drop, 0, file, MAX_PATH);
+    DragFinish(drop);
+    if (n > 0 && n < MAX_PATH) {
+        OpenCapture(file);
+    }
+}
+
 void ShowAll()
 {
     g.syncing = true;
@@ -881,6 +1000,7 @@ void ShowAll()
 
 void CreateControls()
 {
+    g.open = MakeChild(L"BUTTON", L"Open capture…", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_OPEN);
     g.start = MakeChild(L"BUTTON", L"Stop", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_START);
     g.pause = MakeChild(L"BUTTON", L"Pause", BS_AUTOCHECKBOX | BS_PUSHLIKE | WS_TABSTOP, 0, IDC_PAUSE);
     g.clear = MakeChild(L"BUTTON", L"Clear", BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_CLEAR);
@@ -1026,7 +1146,20 @@ void OnCreate(HWND wnd)
     ApplyFonts();
     SetLogHeader();
     Layout();
-    StartStop();
+    // A capture named on the command line opens once the window is up;
+    // otherwise listening starts at once.
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv != nullptr && argc >= 2 && argv[1][0] != L'\0') {
+        g.pendingOpen = argv[1];
+        SetWindowTextW(g.start, L"Start");
+        PostMessageW(wnd, kMsgOpenPending, 0, 0);
+    } else {
+        StartStop();
+    }
+    if (argv != nullptr) {
+        LocalFree(argv);
+    }
     SetTimer(wnd, kTimerId, kTimerMs, nullptr);
 }
 
@@ -1071,9 +1204,16 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         switch (LOWORD(wp)) {
         case IDC_START: StartStop(); return 0;
         case IDC_PAUSE: TogglePause(); return 0;
-        case IDC_CLEAR: ClearAll(); return 0;
+        case IDC_CLEAR:
+            if (g.fromFile) {   // the file's figures no longer describe the log
+                g.fromFile = false;
+                SetTitle(std::wstring());
+            }
+            ClearAll();
+            return 0;
         case IDC_SHOWALL: ShowAll(); return 0;
         case IDC_COPY: CopyDecode(); return 0;
+        case IDC_OPEN: ChooseCapture(); return 0;
         default: break;
         }
         break;
@@ -1084,6 +1224,14 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_DPICHANGED: OnDpiChanged(wnd, HIWORD(wp), reinterpret_cast<const RECT*>(lp)); return 0;
     case seqview::kMsgArrowClicked: OnArrowClicked(static_cast<uint64_t>(wp)); return 0;
+    case WM_DROPFILES: OnDropFiles(reinterpret_cast<HDROP>(wp)); return 0;
+    case kMsgOpenPending:
+        if (!g.pendingOpen.empty()) {
+            const std::wstring path = std::move(g.pendingOpen);
+            g.pendingOpen.clear();
+            OpenCapture(path);
+        }
+        return 0;
     case WM_DESTROY:
         KillTimer(wnd, kTimerId);
         g.listener.Stop();
@@ -1115,13 +1263,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
     wc.lpszClassName = kClassName;
-    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIcon = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(kIconId), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
+    wc.hIconSm = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(kIconId), IMAGE_ICON,
+                                               GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
     if (RegisterClassExW(&wc) == 0 || !seqview::Register(inst)) {
         WSACleanup();
         return 1;
     }
     const int sys = static_cast<int>(GetDpiForSystem());
-    HWND wnd = CreateWindowExW(0, kClassName, L"MDNS Listener " MDNSL_VERSION_W,
+    HWND wnd = CreateWindowExW(WS_EX_ACCEPTFILES, kClassName, L"MDNS Listener " MDNSL_VERSION_W,
                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                                MulDiv(1400, sys, 96), MulDiv(860, sys, 96), nullptr, nullptr, inst, nullptr);
     if (wnd == nullptr) {

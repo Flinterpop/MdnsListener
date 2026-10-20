@@ -90,12 +90,49 @@ void DrawHead(HDC dc, int x, int y, int dir, int size)
     Polygon(dc, pts, 3);
 }
 
-void DrawArrow(HDC dc, HWND h, const Geometry& g, const State& st, const Arrow& a, int rowTop)
+// One line of text on a patch of the row's own background, just as wide as
+// the text, so the dotted lifelines do not run through it.
+void DrawLabel(HDC dc, const std::wstring& s, const RECT& box, UINT vAlign, COLORREF fg, COLORREF bg)
+{
+    assert(vAlign == DT_TOP || vAlign == DT_BOTTOM);
+    if (s.empty() || box.right <= box.left) {
+        return;
+    }
+    RECT calc = box;
+    const int ht = DrawTextW(dc, s.c_str(), -1, &calc, DT_SINGLELINE | DT_CALCRECT | DT_NOPREFIX);
+    assert(ht >= 0);
+    const int w = std::min(static_cast<int>(calc.right - calc.left), static_cast<int>(box.right - box.left));
+    RECT patch{(box.left + box.right - w) / 2, 0, 0, 0};
+    patch.right = patch.left + w;
+    patch.top = (vAlign == DT_BOTTOM) ? std::max(box.bottom - ht, box.top) : box.top;
+    patch.bottom = (vAlign == DT_BOTTOM) ? box.bottom : std::min(box.top + ht, box.bottom);
+    HBRUSH b = CreateSolidBrush(bg);
+    if (b != nullptr) {
+        FillRect(dc, &patch, b);
+        DeleteObject(b);
+    }
+    SetTextColor(dc, fg);
+    RECT r = box;
+    DrawTextW(dc, s.c_str(), -1, &r, DT_SINGLELINE | vAlign | DT_CENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+}
+
+void DrawArrow(HDC dc, HWND h, const Geometry& g, const State& st, const Arrow& a, int rowTop, COLORREF bg)
 {
     const int x1 = LaneX(g, st, a.from);
     const int x2 = LaneX(g, st, a.to);
     const int y = rowTop + g.rowH / 2 + S(h, 2);
     const COLORREF c = KindColor(a.kind);
+
+    // Text first, so the arrow's own line stays on top of the label's patch.
+    // Text may use the half-lanes either side of the arrow, so a message
+    // between neighbouring lifelines still reads.
+    const int lo = std::min(x1, x2) - g.laneW / 2;
+    const int hi = std::max(x1, x2) + g.laneW / 2;
+    const RECT label{lo + S(h, 4), rowTop + S(h, 1), hi - S(h, 4), y - S(h, 2)};
+    DrawLabel(dc, a.label, label, DT_BOTTOM, c, bg);
+    const RECT note{lo + S(h, 4), y + S(h, 3), hi - S(h, 4), rowTop + g.rowH};
+    DrawLabel(dc, a.note, note, DT_TOP, RGB(110, 110, 110), bg);
+
     const bool dashed = (a.kind == Kind::Announcement || a.kind == Kind::Goodbye);
     HPEN pen = CreatePen(dashed ? PS_DOT : PS_SOLID, dashed ? 1 : S(h, 2), c);
     HBRUSH brush = CreateSolidBrush(c);
@@ -119,17 +156,6 @@ void DrawArrow(HDC dc, HWND h, const Geometry& g, const State& st, const Arrow& 
     SelectObject(dc, oldBrush);
     DeleteObject(pen);
     DeleteObject(brush);
-
-    // Text may use the half-lanes either side of the arrow, so a message
-    // between neighbouring lifelines still reads.
-    const int lo = std::min(x1, x2) - g.laneW / 2;
-    const int hi = std::max(x1, x2) + g.laneW / 2;
-    RECT label{lo + S(h, 4), rowTop + S(h, 1), hi - S(h, 4), y - S(h, 2)};
-    SetTextColor(dc, c);
-    DrawTextW(dc, a.label.c_str(), -1, &label, DT_SINGLELINE | DT_BOTTOM | DT_CENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
-    RECT note{lo + S(h, 4), y + S(h, 3), hi - S(h, 4), rowTop + g.rowH};
-    SetTextColor(dc, RGB(110, 110, 110));
-    DrawTextW(dc, a.note.c_str(), -1, &note, DT_SINGLELINE | DT_TOP | DT_CENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
 }
 
 void PaintRows(HDC dc, HWND h, const Geometry& g, const State& st, const RECT& rc)
@@ -140,10 +166,11 @@ void PaintRows(HDC dc, HWND h, const Geometry& g, const State& st, const RECT& r
     for (int r = first; r < last; ++r) {
         const Arrow& a = st.chart.arrows[static_cast<size_t>(r)];
         const int top = g.top + r * g.rowH - st.scrollY;
-        if (a.seq == st.selected) {
+        const COLORREF lite = RGB(220, 235, 252);
+        const bool selected = (a.seq == st.selected);
+        if (selected) {
             RECT band{0, top, rc.right, top + g.rowH};
             FillRect(dc, &band, GetSysColorBrush(COLOR_HIGHLIGHT));
-            const COLORREF lite = RGB(220, 235, 252);
             HBRUSH b = CreateSolidBrush(lite);
             InflateRect(&band, 0, -1);
             FillRect(dc, &band, b);
@@ -152,7 +179,7 @@ void PaintRows(HDC dc, HWND h, const Geometry& g, const State& st, const RECT& r
         RECT left{S(h, 6) - st.scrollX, top, g.leftW - S(h, 4) - st.scrollX, top + g.rowH};
         SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
         DrawTextW(dc, a.left.c_str(), -1, &left, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
-        DrawArrow(dc, h, g, st, a, top);
+        DrawArrow(dc, h, g, st, a, top, selected ? lite : GetSysColor(COLOR_WINDOW));
     }
 }
 

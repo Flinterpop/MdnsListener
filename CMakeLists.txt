@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(MdnsListener VERSION 0.1.0 LANGUAGES CXX RC)
+project(MdnsListener VERSION 0.2.0 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,6 +13,8 @@ configure_file(src/gui/version.h.in ${CMAKE_CURRENT_BINARY_DIR}/generated/versio
 
 # Decoder, conversation table, hex dump and socket listener: no UI.
 add_library(mdnscore STATIC
+    src/core/Capture.cpp
+    src/core/Capture.h
     src/core/Conversations.cpp
     src/core/Conversations.h
     src/core/Dns.cpp
@@ -36,15 +38,18 @@ add_executable(MdnsListener WIN32
     src/gui/MdnsListener.manifest
 )
 target_include_directories(MdnsListener PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_link_libraries(MdnsListener PRIVATE mdnscore comctl32)
+target_link_libraries(MdnsListener PRIVATE mdnscore comctl32 comdlg32 shell32)
 
 enable_testing()
 add_executable(test_mdns tests/test_mdns.cpp)
 target_link_libraries(test_mdns PRIVATE mdnscore)
 add_test(NAME test_mdns COMMAND test_mdns)
+add_executable(test_capture tests/test_capture.cpp)
+target_link_libraries(test_capture PRIVATE mdnscore)
+add_test(NAME test_capture COMMAND test_capture)
 
 if(MSVC)
-    foreach(target mdnscore MdnsListener test_mdns)
+    foreach(target mdnscore MdnsListener test_mdns test_capture)
         target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /WX /permissive- /utf-8>)
     endforeach()
 endif()

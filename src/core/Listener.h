@@ -22,7 +22,8 @@ struct Packet {
     uint16_t sourcePort = 0;
     std::string destination;    // from IP_PKTINFO; "?" when not delivered
     uint32_t ifIndex = 0;
-    bool truncated = false;     // datagram larger than the receive buffer
+    std::string ifName;         // set for packets read from a capture file
+    bool truncated = false;     // only part of the datagram was received or captured
     std::vector<uint8_t> data;
 };
 
