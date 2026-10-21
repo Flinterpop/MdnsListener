@@ -32,7 +32,7 @@ A malformed packet is decoded as far as it is valid, and the first fault is name
 
 ## Opening a capture
 
-**Open capture…**, a file dropped on the window, or a path on the command line (`MdnsListener.exe capture.pcapng`) stops listening and shows the mDNS in a capture file, with every pane working as it does live. The title bar names the file, and the status line gives the mDNS count, the frame count, and anything skipped. A file that is not a capture is refused with a message saying why; by then listening has stopped and the log is clear, so press **Start** to go back to live.
+**Open capture…**, a file dropped on the window, or a path on the command line (`MdnsListener.exe capture.pcapng`) stops listening and shows the mDNS in a capture file, with every pane working as it does live. The title bar names the file, and the status line gives the mDNS count, the frame count, and anything skipped. A file that is not a capture is refused with a message saying why, and nothing else changes: the file is read before listening stops, so whatever was showing, live or another file, is still there. A refused file named on the command line starts listening instead, as a start without one would.
 
 - **Formats:** classic pcap in either byte order, with microsecond or nanosecond timestamps; pcapng with any number of sections and interfaces, each with its own timestamp resolution and offset. The Interface column shows the pcapng interface description (Wireshark's "Wi-Fi"), else its name, else "interface *N*"; for a classic pcap, which names no interfaces, it shows "capture".
 - **Link types:** Ethernet (up to two VLAN tags), BSD null/loopback (Npcap's loopback adapter), raw IPv4/IPv6, Linux cooked SLL and SLL2. Frames on any other link type are counted and skipped.
@@ -54,7 +54,9 @@ The exe is static-CRT and needs no redistributable. First-party code builds `/W4
 
 - **`ctest`** runs both unit suites: `test_mdns` (decoder, hex dump, conversations, sequence model, 200,000-packet decoder fuzz) and `test_capture` (the capture reader, with a 100,000-file fuzz pass).
 - **Live:** `tools\drive_smoke.ps1 -Exe <exe>` launches its own instance, feeds it over loopback with `tools/feed_mdns.py`, and checks the count one-for-one, the panes, the filter and Pause.
-- **Capture files:** the reader is checked against Wireshark rather than only against files built by its own tests. Record the feeder with `dumpcap -i \Device\NPF_Loopback -f "udp port 5353"` while it runs, convert the result with `editcap -F pcap` and `editcap -F nsecpcap`, then compare `test_capture --read <files>` with tshark's count (`tshark -r <file> -Y udp.port==5353`). `tools\drive_capture.ps1 -Exe <exe> -File <capture> -Expect <tshark's count>` then drives the GUI through the same file.
+- **Capture files:** the reader is checked against Wireshark rather than only against files built by its own tests. Record the feeder with `dumpcap -i \Device\NPF_Loopback -f "udp port 5353"` while it runs, convert the result with `editcap -F pcap` and `editcap -F nsecpcap`, then compare `test_capture --read <files>` with tshark's count (`tshark -r <file> -Y udp.port==5353`). `tools\drive_capture.ps1 -Exe <exe> -File <capture> -Expect <tshark's count>` then drives the GUI through the same file, by the command line, the Open dialog and a drop.
+- **Layout:** `tools\drive_layout.ps1 -Exe <exe> -File <capture>` drags each splitter and sends a DPI change, and checks what moved.
+- **Power of 10:** `python tools/p10.py` measures the code against the rules; the results and the recorded deviations are in [docs/POWER_OF_10.md](docs/POWER_OF_10.md).
 - A capture made on a real interface carries the LAN's host names and addresses: keep it in the git-ignored `build/claude-scratch/`, as the drivers' screenshots are.
 
 ## Layout
@@ -75,13 +77,19 @@ The exe is static-CRT and needs no redistributable. First-party code builds `/W4
 | `tests/test_capture.cpp` | Capture reader tests: both pcap byte orders and resolutions, multi-section multi-interface pcapng, every link type, fragments, snapped and damaged files, and a 100,000-file fuzz pass. `test_capture --read <files>` prints what the reader makes of real captures |
 | `tools/feed_mdns.py` | Bench feeder: a two-host exchange over the **loopback interface only**: queries (and optionally malformed packets) from 127.0.0.1, responses from 127.0.0.2 |
 | `tools/drive_smoke.ps1` | Live GUI driver: launches its own instance and feeds it. It checks the count one-for-one, selects a row, a tree line, the Sequence tab and a conversation, and checks that Pause holds and Resume releases every packet. It captures PNGs into `build/claude-scratch/` and closes the instance. `-Exe` picks the build |
-| `tools/drive_capture.ps1` | Capture-file GUI driver: opens `-File` from the command line and again through the Open dialog, checks the counts against `-Expect` and the log's rows, decodes the first packet, checks that Start and Clear leave the file, and that a non-capture raises exactly one warning |
+| `tools/drive_capture.ps1` | Capture-file GUI driver. It opens `-File` from the command line, through the Open dialog, and by a drop, and checks the counts against `-Expect` and the log's rows. It decodes the first packet and checks that Start and Clear leave the file. It checks that a non-capture, given any of those three ways, raises exactly one warning and changes nothing |
+| `tools/drive_layout.ps1` | Layout driver: drags each splitter by a known distance and past its limit, then sends `WM_DPICHANGED` to 96 dpi and back, and checks the panes, the window rectangle, the button heights and the column widths |
+| `tools/p10.py` | Power of 10 measurements of `src/core` and `src/gui` (`mypy --strict` and `ruff` clean) |
 | `tools/make_icon.py` | Draws each icon size on its own and writes the `.ico` |
+| `docs/POWER_OF_10.md` | The Power of 10 pass: figures, rule by rule, and the deviations |
 
-Drag-and-drop is the one way in that no driver exercises: a dropped file's handle has to be made inside the app's own process, so a script cannot post one.
+A dropped file's handle has to be made inside the app's own process, so a script cannot post one. The drop driver therefore sends the same `DROPFILES` block the shell would build, as a `WM_COPYDATA` tagged `MDND`. The app copies that block into a real handle and posts itself `WM_DROPFILES`, so the drop handler runs exactly as it does for Explorer. The one part not driven is Explorer building that handle. The DPI check is likewise sent rather than caused, because it was written on a single-monitor machine.
 
 ## Power of 10 deviations
+
+The full pass is in [docs/POWER_OF_10.md](docs/POWER_OF_10.md). In short:
 
 - The receive loop and the UI message pump are unbounded by design.
 - `WSARecvMsg` can only be reached through an extension function pointer (`Listener::recvMsg_`), so the program has that one function pointer.
 - The log, the conversation table, the held packets and a capture file's buffer live in standard containers on the heap. Each is capped (20,000 packets, 4,096 hosts, 1 GiB), but they grow after initialisation rather than being preallocated.
+- Most functions outside the capture reader still carry fewer than two asserts. Input from the network or a file is validated and reported rather than asserted, so asserts belong only on internal invariants, and those have yet to be worked through file by file.

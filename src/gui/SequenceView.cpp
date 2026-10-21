@@ -331,10 +331,10 @@ LRESULT CALLBACK Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(fresh));
         break;
     }
-    case WM_NCDESTROY:
+    case WM_NCDESTROY:   // the last message: nothing below may touch st after this
         delete st;
         SetWindowLongPtrW(h, GWLP_USERDATA, 0);
-        break;
+        return DefWindowProcW(h, msg, wp, lp);
     default:
         break;
     }

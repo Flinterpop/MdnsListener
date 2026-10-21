@@ -33,6 +33,7 @@ uint32_t Get32(const uint8_t* p, bool be)
 
 uint64_t Get64(const uint8_t* p, bool be)
 {
+    assert(p != nullptr);
     const uint64_t first = Get32(p, be), second = Get32(p + 4, be);
     return be ? (first << 32) | second : (second << 32) | first;
 }
@@ -133,7 +134,7 @@ struct IpView {
 
 Verdict ParseIpv4(const uint8_t* f, size_t n, size_t off, IpView& ip)
 {
-    assert(off <= n);
+    assert(f != nullptr && off <= n);
     const uint8_t* h = f + off;
     const size_t avail = n - off;
     if (avail < 20 || (h[0] >> 4) != 4) {
@@ -152,6 +153,7 @@ Verdict ParseIpv4(const uint8_t* f, size_t n, size_t off, IpView& ip)
     }
     ip.udp = off + ihl;
     ip.end = off + std::min(total, avail);
+    assert(ip.udp <= ip.end && ip.end <= n);   // ihl <= total and ihl <= avail
     ip.ipv6 = false;
     ip.source = Address(AF_INET, h + 12);
     ip.destination = Address(AF_INET, h + 16);
@@ -160,7 +162,7 @@ Verdict ParseIpv4(const uint8_t* f, size_t n, size_t off, IpView& ip)
 
 Verdict ParseIpv6(const uint8_t* f, size_t n, size_t off, IpView& ip)
 {
-    assert(off <= n);
+    assert(f != nullptr && off <= n);
     const uint8_t* h = f + off;
     const size_t avail = n - off;
     if (avail < 40 || (h[0] >> 4) != 6) {
@@ -189,6 +191,7 @@ Verdict ParseIpv6(const uint8_t* f, size_t n, size_t off, IpView& ip)
     }
     ip.udp = p;
     ip.end = end;
+    assert(ip.udp <= ip.end && ip.end <= n);
     ip.ipv6 = true;
     ip.source = Address(AF_INET6, h + 8);
     ip.destination = Address(AF_INET6, h + 24);
@@ -202,6 +205,7 @@ Verdict Extract(const Frame& fr, Packet& pkt)
     if (!LinkPayload(fr.link, fr.data, fr.size, off, version)) {
         return Verdict::UnknownLink;
     }
+    assert(off <= fr.size);   // a link header is only skipped when it fits
     IpView ip;
     const Verdict v = version == 4   ? ParseIpv4(fr.data, fr.size, off, ip)
                       : version == 6 ? ParseIpv6(fr.data, fr.size, off, ip)
@@ -221,6 +225,7 @@ Verdict Extract(const Frame& fr, Packet& pkt)
     }
     const size_t want = ulen - 8;
     const size_t have = std::min(want, ip.end - ip.udp - 8);
+    assert(ip.udp + 8 + have <= fr.size);
     pkt.time = fr.time;
     pkt.ipv6 = ip.ipv6;
     pkt.source = std::move(ip.source);
@@ -235,6 +240,8 @@ Verdict Extract(const Frame& fr, Packet& pkt)
 
 void Account(const Frame& fr, size_t maxPackets, CaptureResult& out)
 {
+    assert(fr.data != nullptr || fr.size == 0);
+    assert(out.packets.size() <= maxPackets);
     ++out.frames;
     Packet pkt;
     switch (Extract(fr, pkt)) {
@@ -257,6 +264,7 @@ void Account(const Frame& fr, size_t maxPackets, CaptureResult& out)
 
 bool ReadPcap(const uint8_t* d, size_t n, size_t maxPackets, CaptureResult& out, std::string& error)
 {
+    assert(d != nullptr && n >= 4);   // ReadCapture has seen the magic
     const uint32_t magic = Get32(d, false);
     const bool be = (magic == 0xD4C3B2A1u || magic == 0x4D3CB2A1u);
     const bool nano = (magic == 0xA1B23C4Du || magic == 0x4D3CB2A1u);
@@ -288,6 +296,7 @@ bool ReadPcap(const uint8_t* d, size_t n, size_t maxPackets, CaptureResult& out,
         Account(fr, maxPackets, out);
         off += 16 + incl;
     }
+    assert(off <= n);   // each record was checked to fit before it was stepped over
     return true;
 }
 
@@ -312,6 +321,7 @@ uint64_t Resolution(uint8_t r)
     for (int i = 0; i < std::min(exp, 19); ++i) {
         u *= 10;
     }
+    assert(u >= 1);   // 10^19 still fits, so it never wraps to 0 (NgTime divides by it)
     return u;
 }
 
@@ -339,6 +349,7 @@ Interface ReadIdb(const uint8_t* body, size_t len, bool be, uint32_t index)
             ifc.offsetSeconds = static_cast<int64_t>(Get64(body + p, be));
         }
         p += (olen + 3) & ~size_t{3};
+        assert(p <= len + 3);   // olen fitted, and padding adds at most 3
     }
     // dumpcap's if_name is a device path ("\Device\NPF_{...}") and its
     // description the adapter's own name, which is the one people know.
@@ -353,6 +364,7 @@ Interface ReadIdb(const uint8_t* body, size_t len, bool be, uint32_t index)
 
 uint64_t NgTime(const Interface& ifc, uint32_t high, uint32_t low)
 {
+    assert(ifc.unitsPerSecond > 0);
     const uint64_t ts = (uint64_t{high} << 32) | low;
     const uint64_t sec = ts / ifc.unitsPerSecond;
     const int64_t shifted = static_cast<int64_t>(std::min(sec, kMaxUnixSeconds + 1)) + ifc.offsetSeconds;
@@ -367,6 +379,7 @@ void ReadPacketBlock(uint32_t type, const uint8_t* body, size_t len, bool be,
                      const std::vector<Interface>& ifs, size_t maxPackets, CaptureResult& out)
 {
     assert(type == 2 || type == 3 || type == 6);
+    assert(body != nullptr);
     const size_t head = (type == 3) ? 4 : 20;
     if (len < head) {
         out.warning = "A packet block is shorter than its header.";
@@ -393,6 +406,7 @@ void ReadPacketBlock(uint32_t type, const uint8_t* body, size_t len, bool be,
 
 bool ReadPcapng(const uint8_t* d, size_t n, size_t maxPackets, CaptureResult& out, std::string& error)
 {
+    assert(d != nullptr && n >= 4);   // ReadCapture has seen the magic
     out.format = "pcapng";
     std::vector<Interface> ifs;
     bool be = false;
@@ -426,6 +440,7 @@ bool ReadPcapng(const uint8_t* d, size_t n, size_t maxPackets, CaptureResult& ou
         }
         off += len;
     }
+    assert(off <= n && ifs.size() <= kMaxInterfaces);
     return true;
 }
 
@@ -444,14 +459,17 @@ bool ReadCapture(const uint8_t* data, size_t size, size_t maxPackets, CaptureRes
         return false;
     }
     const uint32_t magic = Get32(data, false);
+    bool ok = false;
     if (magic == kShb) {
-        return ReadPcapng(data, size, maxPackets, out, error);
+        ok = ReadPcapng(data, size, maxPackets, out, error);
+    } else if (magic == 0xA1B2C3D4u || magic == 0xD4C3B2A1u || magic == 0xA1B23C4Du || magic == 0x4D3CB2A1u) {
+        ok = ReadPcap(data, size, maxPackets, out, error);
+    } else {
+        error = "This is not a pcap or pcapng file.";
     }
-    if (magic == 0xA1B2C3D4u || magic == 0xD4C3B2A1u || magic == 0xA1B23C4Du || magic == 0x4D3CB2A1u) {
-        return ReadPcap(data, size, maxPackets, out, error);
-    }
-    error = "This is not a pcap or pcapng file.";
-    return false;
+    assert(out.packets.size() <= maxPackets);
+    assert(ok || !error.empty());   // a refusal always says why
+    return ok;
 }
 
 bool ReadCaptureFile(const std::wstring& path, size_t maxPackets, CaptureResult& out, std::string& error)
@@ -465,30 +483,37 @@ bool ReadCaptureFile(const std::wstring& path, size_t maxPackets, CaptureResult&
     LARGE_INTEGER size{};
     std::vector<uint8_t> buf;
     bool ok = GetFileSizeEx(h, &size) != 0;
+    bool partial = false;
     if (ok && static_cast<uint64_t>(size.QuadPart) > kMaxCaptureBytes) {
         error = "The capture is larger than 1 GiB.";
         ok = false;
     } else if (ok) {
         buf.resize(static_cast<size_t>(size.QuadPart));
         size_t got = 0;
-        for (int i = 0; i < 1024 && got < buf.size(); ++i) {   // 1 GiB in chunks of at least 1 MiB
+        for (int i = 0; i < 1024 && got < buf.size(); ++i) {   // 64 MiB reads: 1 GiB takes 16, short reads more
             DWORD n = 0;
             const DWORD want = static_cast<DWORD>(std::min<size_t>(buf.size() - got, 64u << 20));
             if (!ReadFile(h, buf.data() + got, want, &n, nullptr) || n == 0) {
                 break;
             }
             got += n;
+            assert(got <= buf.size());
         }
+        partial = got < buf.size();
         buf.resize(got);
     }
-    CloseHandle(h);
+    (void)CloseHandle(h);   // read-only: nothing is lost if closing fails
     if (!ok) {
         if (error.empty()) {
             error = "The file's size could not be read.";
         }
         return false;
     }
-    return ReadCapture(buf.data(), buf.size(), maxPackets, out, error);
+    const bool read = ReadCapture(buf.data(), buf.size(), maxPackets, out, error);
+    if (read && partial && out.warning.empty()) {
+        out.warning = "Only part of the file could be read.";
+    }
+    return read;
 }
 
 } // namespace mdns

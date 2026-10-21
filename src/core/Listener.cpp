@@ -155,7 +155,7 @@ bool Listener::OpenV4(std::string& status)
     if (!SetInt(s, SOL_SOCKET, SO_REUSEADDR, 1) || !SetInt(s, IPPROTO_IP, IP_PKTINFO, 1) ||
         bind(s, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0 || !LoadRecvMsg(s)) {
         status += "IPv4: " + WsaError("bind to UDP 5353") + ". ";
-        closesocket(s);
+        (void)closesocket(s);   // abandoning it; the bind failure is what gets reported
         return false;
     }
     int joined = 0;
@@ -191,7 +191,7 @@ bool Listener::OpenV6(std::string& status)
         !SetInt(s, IPPROTO_IPV6, IPV6_PKTINFO, 1) ||
         bind(s, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0 || !LoadRecvMsg(s)) {
         status += "IPv6: " + WsaError("bind to UDP 5353") + ". ";
-        closesocket(s);
+        (void)closesocket(s);   // abandoning it; the bind failure is what gets reported
         return false;
     }
     int joined = 0;
@@ -236,11 +236,11 @@ bool Listener::Start(std::string& status)
 void Listener::CloseSockets()
 {
     if (v4_ != INVALID_SOCKET) {
-        closesocket(v4_);
+        (void)closesocket(v4_);   // teardown: nothing to do if closing fails
         v4_ = INVALID_SOCKET;
     }
     if (v6_ != INVALID_SOCKET) {
-        closesocket(v6_);
+        (void)closesocket(v6_);
         v6_ = INVALID_SOCKET;
     }
 }

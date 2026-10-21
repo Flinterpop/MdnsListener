@@ -20,6 +20,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <windowsx.h>
 
 #include "Capture.h"
@@ -33,6 +34,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <cwchar>
 #include <deque>
 #include <string>
@@ -67,6 +69,12 @@ enum ControlId : int {
 
 constexpr UINT kMsgOpenPending = WM_APP + 2;   // open the capture named on the command line
 constexpr int kIconId = 1;
+// WM_COPYDATA tag for a DROPFILES block, delivered as the shell's drop would be.
+// A dropped file's HDROP has to be made inside this process, so this is how
+// tools/drive_capture.ps1 exercises the drop handler; it opens nothing a path on the
+// command line could not.
+constexpr ULONG_PTR kCopyDataDrop = 0x4D444E44;   // 'MDND'
+constexpr DWORD kMaxDropBytes = 64 * 1024;
 
 struct LogEntry {
     uint64_t seq = 0;
@@ -125,6 +133,7 @@ struct App {
     double splitX = 0.56, splitLeft = 0.62, splitRight = 0.58;
     RECT vSplit{}, lSplit{}, rSplit{}, content{}, leftArea{}, rightArea{};
     Drag drag = Drag::None;
+    int dragOffset = 0;   // where in the gap it was grabbed, so the gap does not jump
 };
 
 App g;
@@ -334,11 +343,11 @@ void DragTo(POINT pt)
     const int gap = Scale(6);
     if (g.drag == Drag::Vertical) {
         const int width = std::max(static_cast<int>(g.content.right - g.content.left - gap), 1);
-        g.splitX = Clamp(static_cast<double>(pt.x - g.content.left) / width);
+        g.splitX = Clamp(static_cast<double>(pt.x - g.dragOffset - g.content.left) / width);
     } else {
         const RECT& a = (g.drag == Drag::Left) ? g.leftArea : g.rightArea;
         const int avail = std::max(static_cast<int>(a.bottom - a.top - gap - 2 * hh), 1);
-        const double f = Clamp(static_cast<double>(pt.y - a.top - hh) / avail);
+        const double f = Clamp(static_cast<double>(pt.y - g.dragOffset - a.top - hh) / avail);
         (g.drag == Drag::Left ? g.splitLeft : g.splitRight) = f;
     }
     Layout();
@@ -927,10 +936,23 @@ std::wstring FileStatus(const std::wstring& name, const mdns::CaptureResult& r)
     return s;
 }
 
-// Stops listening and shows the mDNS in a capture file instead.
-void OpenCapture(const std::wstring& path)
+// Stops listening and shows the mDNS in a capture file instead. The file is read
+// first, so one that is refused leaves the listener, the log and the title alone.
+bool OpenCapture(const std::wstring& path)
 {
     assert(!path.empty());
+    mdns::CaptureResult r;
+    std::string error;
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    const bool ok = mdns::ReadCaptureFile(path, kMaxLogEntries, r, error);
+    SetCursor(old);
+    const size_t slash = path.find_last_of(L"\\/");
+    const std::wstring name = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+    if (!ok) {
+        MessageBoxW(g.wnd, (L"Could not read " + name + L".\r\n\r\n" + Wide(error)).c_str(), L"MDNS Listener",
+                    MB_ICONWARNING);
+        return false;
+    }
     if (g.listener.Running()) {
         g.listener.Stop();
     }
@@ -940,20 +962,6 @@ void OpenCapture(const std::wstring& path)
     SetWindowTextW(g.pause, L"Pause");
     g.fromFile = false;
     ClearAll();
-    mdns::CaptureResult r;
-    std::string error;
-    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-    const bool ok = mdns::ReadCaptureFile(path, kMaxLogEntries, r, error);
-    SetCursor(old);
-    const size_t slash = path.find_last_of(L"\\/");
-    const std::wstring name = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
-    if (!ok) {
-        g.listenStatus = "Capture not opened.";
-        UpdateStatus();
-        MessageBoxW(g.wnd, (L"Could not read " + name + L".\r\n\r\n" + Wide(error)).c_str(), L"MDNS Listener",
-                    MB_ICONWARNING);
-        return;
-    }
     g.fromFile = true;
     g.fileStatus = FileStatus(name, r);
     SetTitle(name);
@@ -961,6 +969,7 @@ void OpenCapture(const std::wstring& path)
     if (!g.view.empty()) {
         ListView_EnsureVisible(g.log, 0, FALSE);
     }
+    return true;
 }
 
 void ChooseCapture()
@@ -975,7 +984,7 @@ void ChooseCapture()
     ofn.lpstrTitle = L"Open capture";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_EXPLORER;
     if (GetOpenFileNameW(&ofn)) {
-        OpenCapture(file);
+        (void)OpenCapture(file);   // a refusal has already said why, and changed nothing
     }
 }
 
@@ -986,8 +995,42 @@ void OnDropFiles(HDROP drop)
     const UINT n = DragQueryFileW(drop, 0, file, MAX_PATH);
     DragFinish(drop);
     if (n > 0 && n < MAX_PATH) {
-        OpenCapture(file);
+        (void)OpenCapture(file);   // a refusal has already said why, and changed nothing
     }
+}
+
+// A DROPFILES block sent by a driver (kCopyDataDrop) becomes a real HDROP and
+// goes through WM_DROPFILES, so the drop handler runs exactly as for the shell.
+bool OnCopyData(const COPYDATASTRUCT* cds)
+{
+    assert(cds != nullptr);
+    if (cds->dwData != kCopyDataDrop || cds->lpData == nullptr || cds->cbData < sizeof(DROPFILES) + 2 * sizeof(wchar_t) ||
+        cds->cbData > kMaxDropBytes) {
+        return false;
+    }
+    const auto* bytes = static_cast<const BYTE*>(cds->lpData);
+    const auto* df = reinterpret_cast<const DROPFILES*>(bytes);
+    const size_t chars = (cds->cbData - sizeof(DROPFILES)) / sizeof(wchar_t);
+    const auto* list = reinterpret_cast<const wchar_t*>(bytes + sizeof(DROPFILES));
+    if (df->pFiles != sizeof(DROPFILES) || !df->fWide || list[chars - 1] != L'\0' || list[chars - 2] != L'\0') {
+        return false;   // the list must be wide and double-terminated inside the block
+    }
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, cds->cbData);
+    if (h == nullptr) {
+        return false;
+    }
+    void* p = GlobalLock(h);
+    if (p == nullptr) {
+        GlobalFree(h);
+        return false;
+    }
+    std::memcpy(p, bytes, cds->cbData);
+    GlobalUnlock(h);
+    if (!PostMessageW(g.wnd, WM_DROPFILES, reinterpret_cast<WPARAM>(h), 0)) {
+        GlobalFree(h);
+        return false;
+    }
+    return true;   // WM_DROPFILES frees it, through DragFinish
 }
 
 void ShowAll()
@@ -1133,6 +1176,11 @@ void OnLButtonDown(POINT pt)
              : PtInRect(&g.lSplit, pt) ? Drag::Left
              : PtInRect(&g.rSplit, pt) ? Drag::Right
                                        : Drag::None;
+    g.dragOffset = (g.drag == Drag::Vertical) ? static_cast<int>(pt.x - g.vSplit.left)
+                   : (g.drag == Drag::Left)   ? static_cast<int>(pt.y - g.lSplit.top)
+                   : (g.drag == Drag::Right)  ? static_cast<int>(pt.y - g.rSplit.top)
+                                              : 0;
+    assert(g.dragOffset >= 0 && g.dragOffset <= Scale(6));
     if (g.drag != Drag::None) {
         SetCapture(g.wnd);
     }
@@ -1225,11 +1273,14 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DPICHANGED: OnDpiChanged(wnd, HIWORD(wp), reinterpret_cast<const RECT*>(lp)); return 0;
     case seqview::kMsgArrowClicked: OnArrowClicked(static_cast<uint64_t>(wp)); return 0;
     case WM_DROPFILES: OnDropFiles(reinterpret_cast<HDROP>(wp)); return 0;
+    case WM_COPYDATA: return OnCopyData(reinterpret_cast<const COPYDATASTRUCT*>(lp)) ? TRUE : FALSE;
     case kMsgOpenPending:
         if (!g.pendingOpen.empty()) {
             const std::wstring path = std::move(g.pendingOpen);
             g.pendingOpen.clear();
-            OpenCapture(path);
+            if (!OpenCapture(path)) {   // listen, as a start without a file would
+                StartStop();
+            }
         }
         return 0;
     case WM_DESTROY:
@@ -1244,7 +1295,7 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
+int WINAPI wWinMain(_In_ HINSTANCE inst, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int show)
 {
     g.inst = inst;
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_STANDARD_CLASSES};
@@ -1267,7 +1318,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
     wc.hIconSm = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(kIconId), IMAGE_ICON,
                                                GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
     if (RegisterClassExW(&wc) == 0 || !seqview::Register(inst)) {
-        WSACleanup();
+        (void)WSACleanup();
         return 1;
     }
     const int sys = static_cast<int>(GetDpiForSystem());
@@ -1275,7 +1326,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
                                MulDiv(1400, sys, 96), MulDiv(860, sys, 96), nullptr, nullptr, inst, nullptr);
     if (wnd == nullptr) {
-        WSACleanup();
+        (void)WSACleanup();
         return 1;
     }
     ShowWindow(wnd, show);
@@ -1287,6 +1338,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
             DispatchMessageW(&msg);
         }
     }
-    WSACleanup();
+    (void)WSACleanup();
     return static_cast<int>(msg.wParam);
 }
