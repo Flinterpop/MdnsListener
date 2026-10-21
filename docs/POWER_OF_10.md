@@ -71,7 +71,7 @@ The rules are G. Holzmann's *The Power of 10: Rules for Developing Safety-Critic
 6. **Rule 4:** `WndProc` (69 lines, a dispatch table).
 7. **The chart window's state** is a raw `new (std::nothrow)` / `delete` pair owned through `GWLP_USERDATA`. This is the usual Win32 idiom for per-window data, and it is now deleted at exactly one point.
 
-## Second pass: 20 Oct 2026, rule 5 across the rest of the core
+## Second pass: 20 Oct 2026, at v0.2.2: rule 5 across the rest of the core
 
 The table above is the first pass. What moved in `src/core`:
 
