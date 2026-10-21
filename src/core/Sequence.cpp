@@ -28,10 +28,14 @@ void AddName(std::vector<std::string>& list, const std::string& name)
     if (std::find(list.begin(), list.end(), key) == list.end()) {
         list.push_back(key);
     }
+    assert(list.size() <= kMaxSeqNames);
 }
 
 bool InAny(const std::string& name, const NameSet& set)
 {
+    assert(!name.empty());   // AddName never stores one
+    assert(set.asked.size() <= kMaxSeqNames && set.owners.size() <= kMaxSeqNames &&
+           set.targets.size() <= kMaxSeqNames);   // bounds the three searches
     const auto has = [&name](const std::vector<std::string>& l) {
         return std::find(l.begin(), l.end(), name) != l.end();
     };
@@ -40,6 +44,7 @@ bool InAny(const std::string& name, const NameSet& set)
 
 bool Intersects(const std::vector<std::string>& a, const std::vector<std::string>& b)
 {
+    assert(a.size() <= kMaxSeqNames && b.size() <= kMaxSeqNames);   // at most 64 x 64 compares
     for (const std::string& n : a) {
         if (std::find(b.begin(), b.end(), n) != b.end()) {
             return true;
@@ -51,18 +56,23 @@ bool Intersects(const std::vector<std::string>& a, const std::vector<std::string
 std::string Shorten(const std::string& s, size_t max)
 {
     assert(max > 3);
-    return s.size() <= max ? s : s.substr(0, max - 3) + "...";
+    std::string t = s.size() <= max ? s : s.substr(0, max - 3) + "...";
+    assert(t.size() <= max);
+    return t;
 }
 
 std::string Millis(uint64_t ticks)
 {
     char buf[32];
-    std::snprintf(buf, sizeof(buf), "%llu ms", static_cast<unsigned long long>(ticks / 10000));
-    return buf;
+    const int r = std::snprintf(buf, sizeof(buf), "%llu ms", static_cast<unsigned long long>(ticks / 10000));
+    assert(r > 0 && r < static_cast<int>(sizeof(buf)));   // at most 20 digits and " ms"
+    return r > 0 ? std::string(buf) : std::string("? ms");
 }
 
 bool IsGoodbye(const Message& m)
 {
+    assert(m.IsResponse());   // MakeArrow asks only of responses
+    assert(m.records.size() <= kMaxRecords);
     bool any = false;
     for (const Record& r : m.records) {
         if (r.section != Section::Answer) {
@@ -112,6 +122,7 @@ constexpr int kGroupPending = -1;   // replaced by the group's index at the end
 int FindQuery(const std::vector<SeqMessage>& msgs, size_t i)
 {
     assert(i < msgs.size());
+    assert(msgs[i].msg != nullptr && msgs[i].msg->IsResponse());   // only a response answers
     const SeqMessage& r = msgs[i];
     for (size_t k = i; k-- > 0;) {
         const SeqMessage& q = msgs[k];
@@ -128,6 +139,7 @@ int FindQuery(const std::vector<SeqMessage>& msgs, size_t i)
 
 SeqArrow MakeArrow(const std::vector<SeqMessage>& msgs, size_t i, Lifelines& lanes)
 {
+    assert(i < msgs.size());
     const SeqMessage& m = msgs[i];
     assert(m.msg != nullptr);
     SeqArrow a;
@@ -160,6 +172,7 @@ SeqArrow MakeArrow(const std::vector<SeqMessage>& msgs, size_t i, Lifelines& lan
             a.note = "unsolicited: announcement or answer to an unseen query";
         }
     }
+    assert(a.from >= 0 && (a.to >= 0 || a.to == kGroupPending));
     return a;
 }
 
@@ -167,6 +180,7 @@ SeqArrow MakeArrow(const std::vector<SeqMessage>& msgs, size_t i, Lifelines& lan
 
 NameSet CollectNames(const Message& msg)
 {
+    assert(msg.questions.size() + msg.records.size() <= kMaxRecords);   // Decode stops there
     NameSet s;
     for (const Question& q : msg.questions) {
         AddName(s.asked, q.name);
@@ -180,11 +194,15 @@ NameSet CollectNames(const Message& msg)
             AddName(s.targets, r.data);
         }
     }
+    assert(s.asked.size() <= kMaxSeqNames && s.owners.size() <= kMaxSeqNames &&
+           s.targets.size() <= kMaxSeqNames);
     return s;
 }
 
 bool Shares(const NameSet& a, const NameSet& b)
 {
+    assert(a.asked.size() <= kMaxSeqNames && a.owners.size() <= kMaxSeqNames &&
+           a.targets.size() <= kMaxSeqNames);   // InAny checks b's
     for (const auto* list : {&a.asked, &a.owners, &a.targets}) {
         for (const std::string& n : *list) {
             if (InAny(n, b)) {

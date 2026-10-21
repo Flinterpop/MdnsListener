@@ -92,4 +92,4 @@ The full pass is in [docs/POWER_OF_10.md](docs/POWER_OF_10.md). In short:
 - The receive loop and the UI message pump are unbounded by design.
 - `WSARecvMsg` can only be reached through an extension function pointer (`Listener::recvMsg_`), so the program has that one function pointer.
 - The log, the conversation table, the held packets and a capture file's buffer live in standard containers on the heap. Each is capped (20,000 packets, 4,096 hosts, 1 GiB), but they grow after initialisation rather than being preallocated.
-- Most functions outside the capture reader still carry fewer than two asserts. Input from the network or a file is validated and reported rather than asserted, so asserts belong only on internal invariants, and those have yet to be worked through file by file.
+- 21 of the core's 95 functions carry fewer than two asserts: byte readers, name tables and thin wrappers with no second invariant to state. Input from the network or a file is validated and reported rather than asserted, so asserts sit only on internal invariants. The GUI's message handlers are not yet covered.

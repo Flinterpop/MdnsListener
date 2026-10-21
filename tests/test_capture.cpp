@@ -4,6 +4,7 @@
 // Addresses are the documentation ranges (RFC 5737, RFC 3849).
 #include "Capture.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -338,6 +339,38 @@ void TestPcapng()
     CHECK(!r.warning.empty() && r.packets.size() == 3);
 }
 
+// if_tsoffset (option 14) moves every time on that interface by whole
+// seconds. It comes from the file, so the extremes must give "no time"
+// rather than overflow the sum.
+void TestTimeOffset()
+{
+    const int64_t offsets[] = {3600, -3600, INT64_MAX, INT64_MIN, -int64_t{kSec} - 1};
+    const uint64_t want[] = {kEpoch + uint64_t{kSec + 3600} * 10000000ull,
+                             kEpoch + uint64_t{kSec - 3600} * 10000000ull, 0, 0, 0};
+    for (size_t i = 0; i < 5; ++i) {
+        Out o;
+        o.be = false;
+        Shb(o);
+        Out b;
+        b.be = false;
+        b.U16(101); b.U16(0); b.U32(0);
+        b.U16(14); b.U16(8);
+        b.U32(static_cast<uint32_t>(static_cast<uint64_t>(offsets[i])));
+        b.U32(static_cast<uint32_t>(static_cast<uint64_t>(offsets[i]) >> 32));
+        b.U16(0); b.U16(0);
+        Block(o, 1, b.b);
+        Epb(o, 0, uint64_t{kSec} * 1000000ull, Ipv4(Udp(5353, 5353, kPayload)));
+        mdns::CaptureResult r;
+        std::string error;
+        CHECK(mdns::ReadCapture(o.b.data(), o.b.size(), 10, r, error));
+        CHECK(r.packets.size() == 1);
+        if (r.packets.size() == 1 && r.packets[0].time != want[i]) {
+            std::printf("  offset case %zu\n", i);
+            CHECK(false);
+        }
+    }
+}
+
 // Random corruptions of both files: no crash, no assertion, nothing kept
 // that is longer than the file it came from.
 void TestFuzz()
@@ -408,6 +441,7 @@ int main(int argc, char** argv)
     TestPcapDamaged();
     TestOtherLinks();
     TestPcapng();
+    TestTimeOffset();
     TestFuzz();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

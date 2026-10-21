@@ -29,13 +29,15 @@ std::string WsaError(const char* what)
 {
     assert(what != nullptr);
     char buf[160];
-    std::snprintf(buf, sizeof(buf), "%s failed (WSA error %d)", what, WSAGetLastError());
-    return buf;
+    const int r = std::snprintf(buf, sizeof(buf), "%s failed (WSA error %d)", what, WSAGetLastError());
+    assert(r > 0);   // a literal and an int; truncation at 160 is acceptable
+    return r > 0 ? std::string(buf) : std::string(what);
 }
 
 std::string AddressText(const sockaddr* sa)
 {
     assert(sa != nullptr);
+    assert(sa->sa_family == AF_INET || sa->sa_family == AF_INET6);   // from our own two sockets
     char buf[INET6_ADDRSTRLEN + 16] = {};
     if (sa->sa_family == AF_INET) {
         const auto* in = reinterpret_cast<const sockaddr_in*>(sa);
@@ -55,6 +57,7 @@ std::string AddressText(const sockaddr* sa)
 uint16_t PortOf(const sockaddr* sa)
 {
     assert(sa != nullptr);
+    assert(sa->sa_family == AF_INET || sa->sa_family == AF_INET6);
     if (sa->sa_family == AF_INET) {
         return ntohs(reinterpret_cast<const sockaddr_in*>(sa)->sin_port);
     }
@@ -65,12 +68,15 @@ uint64_t Now()
 {
     FILETIME ft{};
     GetSystemTimePreciseAsFileTime(&ft);
-    return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    const uint64_t t = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    assert(t != 0);   // 0 means "no time" to the capture reader and the GUI
+    return t;
 }
 
 bool SetInt(SOCKET s, int level, int name, DWORD value)
 {
     assert(s != INVALID_SOCKET);
+    assert(level == SOL_SOCKET || level == IPPROTO_IP || level == IPPROTO_IPV6);
     return setsockopt(s, level, name, reinterpret_cast<const char*>(&value), sizeof(value)) == 0;
 }
 
@@ -80,10 +86,12 @@ Listener::~Listener()
 {
     Stop();
     assert(!Running());
+    assert(v4_ == INVALID_SOCKET && v6_ == INVALID_SOCKET);
 }
 
 void Listener::EnumerateInterfaces()
 {
+    assert(!Running());   // the receive thread must not see the lists change
     adapters_.clear();
     ifNames_.clear();
     ULONG size = 32 * 1024;
@@ -122,6 +130,7 @@ void Listener::EnumerateInterfaces()
         }
         adapters_.push_back(ad);
     }
+    assert(adapters_.size() <= static_cast<size_t>(kMaxAdapters));
 }
 
 bool Listener::LoadRecvMsg(SOCKET s)
@@ -138,11 +147,13 @@ bool Listener::LoadRecvMsg(SOCKET s)
         return false;
     }
     recvMsg_ = reinterpret_cast<void*>(fn);
+    assert(recvMsg_ != nullptr);   // ReceiveOne calls through it
     return true;
 }
 
 bool Listener::OpenV4(std::string& status)
 {
+    assert(v4_ == INVALID_SOCKET);   // a second open would leak the first socket
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) {
         status += "IPv4: " + WsaError("socket") + ". ";
@@ -158,13 +169,17 @@ bool Listener::OpenV4(std::string& status)
         (void)closesocket(s);   // abandoning it; the bind failure is what gets reported
         return false;
     }
+    assert(recvMsg_ != nullptr);
+    in_addr group{};
+    const int parsed = inet_pton(AF_INET, "224.0.0.251", &group);
+    assert(parsed == 1);   // a constant
     int joined = 0;
     for (const Adapter& a : adapters_) {
-        if (!a.hasIpv4) {
+        if (!a.hasIpv4 || parsed != 1) {
             continue;
         }
         ip_mreq mreq{};
-        inet_pton(AF_INET, "224.0.0.251", &mreq.imr_multiaddr);
+        mreq.imr_multiaddr = group;
         mreq.imr_interface = a.ipv4;
         if (setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, reinterpret_cast<const char*>(&mreq),
                        sizeof(mreq)) == 0) {
@@ -178,6 +193,7 @@ bool Listener::OpenV4(std::string& status)
 
 bool Listener::OpenV6(std::string& status)
 {
+    assert(v6_ == INVALID_SOCKET);   // a second open would leak the first socket
     SOCKET s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) {
         status += "IPv6: " + WsaError("socket") + ". ";
@@ -194,13 +210,17 @@ bool Listener::OpenV6(std::string& status)
         (void)closesocket(s);   // abandoning it; the bind failure is what gets reported
         return false;
     }
+    assert(recvMsg_ != nullptr);
+    in6_addr group{};
+    const int parsed = inet_pton(AF_INET6, "ff02::fb", &group);
+    assert(parsed == 1);   // a constant
     int joined = 0;
     for (const Adapter& a : adapters_) {
-        if (a.ipv6IfIndex == 0) {
+        if (a.ipv6IfIndex == 0 || parsed != 1) {
             continue;
         }
         ipv6_mreq mreq{};
-        inet_pton(AF_INET6, "ff02::fb", &mreq.ipv6mr_multiaddr);
+        mreq.ipv6mr_multiaddr = group;
         mreq.ipv6mr_interface = a.ipv6IfIndex;
         if (setsockopt(s, IPPROTO_IPV6, IPV6_ADD_MEMBERSHIP, reinterpret_cast<const char*>(&mreq),
                        sizeof(mreq)) == 0) {
@@ -235,6 +255,7 @@ bool Listener::Start(std::string& status)
 
 void Listener::CloseSockets()
 {
+    assert(!Running());   // the receive thread selects on these
     if (v4_ != INVALID_SOCKET) {
         (void)closesocket(v4_);   // teardown: nothing to do if closing fails
         v4_ = INVALID_SOCKET;
@@ -243,6 +264,7 @@ void Listener::CloseSockets()
         (void)closesocket(v6_);
         v6_ = INVALID_SOCKET;
     }
+    assert(v4_ == INVALID_SOCKET && v6_ == INVALID_SOCKET);
 }
 
 void Listener::Stop()
@@ -251,6 +273,7 @@ void Listener::Stop()
     if (thread_.joinable()) {
         thread_.join();
     }
+    assert(!Running());
     CloseSockets();
     assert(v4_ == INVALID_SOCKET && v6_ == INVALID_SOCKET);
 }
@@ -259,6 +282,8 @@ void Listener::Stop()
 // program, by design (Power of 10 rule 2 deviation, as for any event pump).
 void Listener::Run()
 {
+    assert(v4_ != INVALID_SOCKET || v6_ != INVALID_SOCKET);   // Start opened at least one
+    assert(recvMsg_ != nullptr);
     while (!stop_) {
         fd_set rd;
         FD_ZERO(&rd);
@@ -340,6 +365,7 @@ void Listener::Drain(std::vector<Packet>& out)
         out.push_back(std::move(p));
     }
     queue_.clear();
+    assert(queue_.empty());
 }
 
 std::string Listener::InterfaceName(uint32_t ifIndex) const

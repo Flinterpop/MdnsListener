@@ -54,7 +54,10 @@ void AppendEscaped(std::string& out, uint8_t c, const char* specials)
 {
     assert(specials != nullptr);
     if (c < 0x20 || c == 0x7F) {
+        const size_t before = out.size();
         out += Format("\\%03u", static_cast<unsigned>(c));
+        assert(out.size() == before + 4);   // always three digits; Format gives "" on failure
+        (void)before;
         return;
     }
     for (const char* s = specials; *s != '\0'; ++s) {
@@ -97,9 +100,8 @@ bool ReadName(const uint8_t* d, size_t n, size_t pos, std::string& name, size_t&
         }
         const uint8_t len = d[cur];
         if (len == 0) {
-            if (!jumped) {
-                end = cur + 1;
-            }
+            end = jumped ? end : cur + 1;
+            assert(end > pos && end <= n);   // set here, or at the first pointer, which fitted
             if (name.empty()) {
                 name = ".";
             }
@@ -169,6 +171,7 @@ size_t AddNode(Ctx& c, int depth, size_t offset, size_t length, std::string text
 void SetNodeLength(Ctx& c, size_t index, size_t length)
 {
     assert(index < c.m.tree.size());
+    assert(length <= c.n);   // a span of the packet: positions only advance past bytes that fitted
     c.m.tree[index].length = static_cast<uint16_t>(length > 0xFFFF ? 0xFFFF : length);
 }
 
@@ -179,11 +182,13 @@ bool Fail(Ctx& c, int depth, size_t offset, const std::string& err)
         c.m.error = err;
     }
     AddNode(c, depth, offset > c.n ? c.n : offset, 0, "Malformed: " + err);
+    assert(!c.m.error.empty());   // Decode's result rests on this: false exactly when there is an error
     return false;
 }
 
 const char* OpcodeName(unsigned op)
 {
+    assert(op <= 15);   // a four-bit field
     switch (op) {
     case 0: return "Standard query";
     case 1: return "Inverse query";
@@ -196,6 +201,7 @@ const char* OpcodeName(unsigned op)
 
 const char* RcodeName(unsigned rc)
 {
+    assert(rc <= 15);   // a four-bit field
     switch (rc) {
     case 0: return "No error";
     case 1: return "Format error";
@@ -224,6 +230,8 @@ std::string BitLine(uint16_t flags, int bit, const char* name, const char* set, 
 
 void DecodeFlags(Ctx& c, uint16_t f)
 {
+    assert(c.n >= kHeaderSize);   // every line below points at bytes 2 and 3
+    assert(f == c.m.flags);
     const unsigned op = (f >> 11) & 0xFu;
     const unsigned rc = f & 0xFu;
     AddNode(c, 1, 2, 2, Format("Flags: 0x%04X (%s %s)", f, OpcodeName(op),
@@ -293,11 +301,16 @@ bool CharString(Ctx& c, size_t pos, size_t end, std::string& text, size_t& next)
         AppendEscaped(text, c.d[pos + 1 + i], "\"\\");
     }
     next = pos + 1 + len;
+    assert(next > pos && next <= end);
     return true;
 }
 
+// Every Rdata* function is handed a record that DecodeRecord has checked
+// lies inside the packet: pos + len <= c.n.
 bool RdataAddress(Ctx& c, int depth, uint16_t type, size_t pos, size_t len, std::string& out)
 {
+    assert(type == 1 || type == 28);
+    assert(pos + len <= c.n);   // inet_ntop reads all `len` bytes
     const size_t want = (type == 1) ? 4u : 16u;
     if (len != want) {
         return Fail(c, depth, pos, Format("%s record has %zu data bytes, expected %zu",
@@ -313,6 +326,8 @@ bool RdataAddress(Ctx& c, int depth, uint16_t type, size_t pos, size_t len, std:
 
 bool RdataName(Ctx& c, int depth, size_t pos, size_t len, const char* label, std::string& out)
 {
+    assert(pos + len <= c.n);
+    assert(label != nullptr);
     size_t end = 0;
     if (!NameField(c, depth, pos, label, out, end)) {
         return false;
@@ -325,6 +340,7 @@ bool RdataName(Ctx& c, int depth, size_t pos, size_t len, const char* label, std
 
 bool RdataSrv(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
 {
+    assert(pos + len <= c.n);
     uint16_t prio = 0, weight = 0, port = 0;
     if (len < 7 || !ReadU16(c.d, c.n, pos, prio) || !ReadU16(c.d, c.n, pos + 2, weight) ||
         !ReadU16(c.d, c.n, pos + 4, port)) {
@@ -343,6 +359,7 @@ bool RdataSrv(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
 
 bool RdataMx(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
 {
+    assert(pos + len <= c.n);
     uint16_t pref = 0;
     if (len < 3 || !ReadU16(c.d, c.n, pos, pref)) {
         return Fail(c, depth, pos, "MX record is too short");
@@ -358,6 +375,8 @@ bool RdataMx(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
 
 bool RdataTxt(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
 {
+    assert(pos + len <= c.n);
+    assert(out.empty());   // the separators and "(empty)" below assume it
     const size_t end = pos + len;
     size_t cur = pos;
     size_t count = 0;
@@ -374,6 +393,7 @@ bool RdataTxt(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
         }
         cur = next;
     }
+    assert(cur == end);   // each string fitted, and len steps are enough for len strings
     if (count == 0) {
         out = "(empty)";
     }
@@ -382,12 +402,14 @@ bool RdataTxt(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
 
 bool RdataHinfo(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
 {
+    assert(pos + len <= c.n);
     std::string cpu, os;
     size_t mid = 0, end = 0;
     if (len < 2 || !CharString(c, pos, pos + len, cpu, mid) || mid >= pos + len ||
         !CharString(c, mid, pos + len, os, end)) {
         return Fail(c, depth, pos, "HINFO record is malformed");
     }
+    assert(pos < mid && mid < end && end <= pos + len);
     AddNode(c, depth, pos, mid - pos, "CPU: " + cpu);
     AddNode(c, depth, mid, end - mid, "OS: " + os);
     out = "\"" + cpu + "\" \"" + os + "\"";
@@ -396,6 +418,7 @@ bool RdataHinfo(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
 
 bool RdataSoa(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
 {
+    assert(pos + len <= c.n);
     std::string mname, rname;
     size_t p1 = 0, p2 = 0;
     if (!NameField(c, depth, pos, "Primary name server", mname, p1) ||
@@ -410,12 +433,14 @@ bool RdataSoa(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
         }
         AddNode(c, depth, p2 + 4 * i, 4, Format("%s: %u", kFields[i], v[i]));
     }
-    out = Format("%s %s %u", mname.c_str(), rname.c_str(), v[0]);
+    assert(p2 + 20 <= pos + len);   // all five fields fitted in the record
+    out =Format("%s %s %u", mname.c_str(), rname.c_str(), v[0]);
     return true;
 }
 
 bool RdataNsec(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
 {
+    assert(pos + len <= c.n);
     std::string next;
     size_t cur = 0;
     if (!NameField(c, depth, pos, "Next domain name", next, cur)) {
@@ -442,6 +467,7 @@ bool RdataNsec(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
         out += (out.back() == '(' ? "" : " ") + types;
         cur += 2 + blen;
     }
+    assert(cur <= end);   // each window was checked to fit before it was stepped over
     out += ")";
     return true;
 }
@@ -457,6 +483,7 @@ std::string HexBytes(const uint8_t* d, size_t len, size_t max)
     if (shown < len) {
         s += "...";
     }
+    assert(s.size() == 2 * shown + (shown < len ? 3u : 0u));   // every Format gave two digits
     return s;
 }
 
@@ -475,6 +502,8 @@ const char* EdnsOptionName(uint16_t code)
 
 bool RdataOpt(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
 {
+    assert(pos + len <= c.n);
+    assert(out.empty());   // the separators and "(no options)" below assume it
     const size_t end = pos + len;
     size_t cur = pos;
     for (size_t i = 0; i < len && cur < end; ++i) {
@@ -494,6 +523,7 @@ bool RdataOpt(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
         out += (out.empty() ? "" : "; ") + std::string(EdnsOptionName(code));
         cur += 4u + olen;
     }
+    assert(cur == end);   // each option fitted and is at least 4 bytes, so len steps are enough
     if (out.empty()) {
         out = "(no options)";
     }
@@ -503,6 +533,7 @@ bool RdataOpt(Ctx& c, int depth, size_t pos, size_t len, std::string& out)
 bool DecodeRdata(Ctx& c, int depth, uint16_t type, size_t pos, size_t len, std::string& out)
 {
     assert(pos + len <= c.n);
+    assert(out.empty());   // a fresh Record's data
     switch (type) {
     case 1:
     case 28: return RdataAddress(c, depth, type, pos, len, out);
@@ -530,6 +561,7 @@ bool DecodeRdata(Ctx& c, int depth, uint16_t type, size_t pos, size_t len, std::
 
 bool DecodeQuestion(Ctx& c, size_t& pos, unsigned index)
 {
+    assert(pos < c.n && index >= 1);   // DecodeSection stops at the end of the packet
     const size_t start = pos;
     const size_t line = AddNode(c, 1, start, 0, "");
     Question q;
@@ -547,6 +579,7 @@ bool DecodeQuestion(Ctx& c, size_t& pos, unsigned index)
     AddNode(c, 2, end + 2, 2, Format("Class: %s (0x%04X)%s", ClassName(q.qclass).c_str(), q.qclass,
                                      q.unicastResponse ? ", unicast response requested (QU)" : ", QM"));
     pos = end + 4;
+    assert(pos > start && pos <= c.n);   // both fixed fields were read
     c.m.tree[line].text = Format("%u. %s: type %s, class %s%s", index, q.name.c_str(),
                                  TypeName(q.type).c_str(), ClassName(q.qclass).c_str(),
                                  q.unicastResponse ? ", QU" : "");
@@ -557,6 +590,8 @@ bool DecodeQuestion(Ctx& c, size_t& pos, unsigned index)
 
 void RecordClassLine(Ctx& c, size_t at, const Record& r, uint16_t rawClass)
 {
+    assert(at + 2 <= c.n);   // the class was read from here
+    assert(r.type != 41 || !r.cacheFlush);   // OPT's class is a payload size, not a flag
     if (r.type == 41) {
         AddNode(c, 2, at, 2, Format("UDP payload size: %u", rawClass));
         return;
@@ -567,6 +602,8 @@ void RecordClassLine(Ctx& c, size_t at, const Record& r, uint16_t rawClass)
 
 std::string RecordHeadline(unsigned index, const Record& r)
 {
+    assert(index >= 1 && index <= 0xFFFF);   // one-based, within a 16-bit section count
+    assert(!r.name.empty());   // ReadName gives "." for the root, never ""
     if (r.type == 41) {
         return Format("%u. OPT (EDNS0): %s", index, r.data.c_str());
     }
@@ -577,6 +614,8 @@ std::string RecordHeadline(unsigned index, const Record& r)
 
 bool DecodeRecord(Ctx& c, size_t& pos, Section section, unsigned index)
 {
+    assert(pos < c.n && index >= 1);   // DecodeSection stops at the end of the packet
+    assert(section != Section::Question);
     const size_t start = pos;
     const size_t line = AddNode(c, 1, start, 0, "");
     Record r;
@@ -604,6 +643,7 @@ bool DecodeRecord(Ctx& c, size_t& pos, Section section, unsigned index)
         return false;
     }
     pos = rd + rdlen;
+    assert(pos > start && pos <= c.n);
     c.m.tree[line].text = RecordHeadline(index, r);
     SetNodeLength(c, line, pos - start);
     c.m.records.push_back(std::move(r));
@@ -622,6 +662,7 @@ const char* SectionTitle(Section s)
 
 bool DecodeSection(Ctx& c, size_t& pos, Section s)
 {
+    assert(static_cast<int>(s) >= 0 && static_cast<int>(s) < 4);   // indexes counts[4]
     const unsigned count = c.m.counts[static_cast<int>(s)];
     if (count == 0) {
         return true;
@@ -639,6 +680,7 @@ bool DecodeSection(Ctx& c, size_t& pos, Section s)
             ok = (s == Section::Question) ? DecodeQuestion(c, pos, i + 1) : DecodeRecord(c, pos, s, i + 1);
         }
     }
+    assert(pos >= start && pos <= c.n);
     SetNodeLength(c, line, pos - start);
     return ok;
 }
@@ -646,7 +688,9 @@ bool DecodeSection(Ctx& c, size_t& pos, Section s)
 std::string Truncate(const std::string& s, size_t max)
 {
     assert(max > 3);
-    return s.size() <= max ? s : s.substr(0, max - 3) + "...";
+    std::string t = s.size() <= max ? s : s.substr(0, max - 3) + "...";
+    assert(t.size() <= max);
+    return t;
 }
 
 } // namespace
@@ -704,6 +748,7 @@ bool Decode(const uint8_t* data, size_t size, Message& out)
     for (int i = 0; i < 4 && ok; ++i) {
         ok = DecodeSection(c, pos, order[i]);
     }
+    assert(pos <= size);
     if (ok && pos < size) {
         AddNode(c, 0, pos, size - pos, Format("Trailing bytes: %zu", size - pos));
     }
@@ -714,6 +759,7 @@ bool Decode(const uint8_t* data, size_t size, Message& out)
 
 std::string Summarize(const Message& msg)
 {
+    assert(msg.questions.size() + msg.records.size() <= kMaxRecords);   // Decode stops there
     std::string s = msg.IsResponse() ? "Response" : "Query";
     size_t shown = 0;
     size_t total = 0;
@@ -743,6 +789,7 @@ std::string Summarize(const Message& msg)
             s += Format(" [%u known answers]", msg.counts[1]);
         }
     }
+    assert(shown <= total);
     if (total > shown) {
         s += Format(" (+%zu more)", total - shown);
     }

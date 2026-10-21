@@ -86,6 +86,7 @@ bool LinkPayload(uint32_t link, const uint8_t* f, size_t n, size_t& off, int& ve
             type = Be16(f + off + 2);
             off += 4;
         }
+        assert(off <= n);   // a VLAN tag is only skipped when it fits
         version = byType(type);
         return true;
     }
@@ -121,6 +122,7 @@ bool LinkPayload(uint32_t link, const uint8_t* f, size_t n, size_t& off, int& ve
 std::string Address(int family, const uint8_t* bytes)
 {
     assert(bytes != nullptr);
+    assert(family == AF_INET || family == AF_INET6);
     char buf[INET6_ADDRSTRLEN] = {};
     return inet_ntop(family, bytes, buf, sizeof(buf)) != nullptr ? std::string(buf) : std::string("?");
 }
@@ -314,14 +316,17 @@ struct Interface {
 uint64_t Resolution(uint8_t r)
 {
     const int exp = r & 0x7F;
-    if ((r & 0x80) != 0) {
-        return uint64_t{1} << std::min(exp, 63);
-    }
     uint64_t u = 1;
-    for (int i = 0; i < std::min(exp, 19); ++i) {
-        u *= 10;
+    if ((r & 0x80) != 0) {
+        u = uint64_t{1} << std::min(exp, 63);
+    } else {
+        for (int i = 0; i < std::min(exp, 19); ++i) {
+            u *= 10;
+        }
     }
-    assert(u >= 1);   // 10^19 still fits, so it never wraps to 0 (NgTime divides by it)
+    // 2^63 and 10^19 both fit, so neither wraps to 0 (NgTime divides by it).
+    assert(u >= 1);
+    assert((r & 0x80) != 0 || u <= 10000000000000000000ull);
     return u;
 }
 
@@ -367,7 +372,12 @@ uint64_t NgTime(const Interface& ifc, uint32_t high, uint32_t low)
     assert(ifc.unitsPerSecond > 0);
     const uint64_t ts = (uint64_t{high} << 32) | low;
     const uint64_t sec = ts / ifc.unitsPerSecond;
-    const int64_t shifted = static_cast<int64_t>(std::min(sec, kMaxUnixSeconds + 1)) + ifc.offsetSeconds;
+    // if_tsoffset comes from the file, so clamp it too: near INT64_MAX the
+    // sum below would overflow. Anything past the limit is garbage anyway.
+    const int64_t limit = static_cast<int64_t>(kMaxUnixSeconds) + 1;
+    const int64_t offset = std::clamp(ifc.offsetSeconds, -limit, limit);
+    const int64_t shifted = static_cast<int64_t>(std::min(sec, kMaxUnixSeconds + 1)) + offset;
+    assert(shifted >= -limit && shifted <= 2 * limit);
     if (shifted < 0) {
         return 0;
     }
@@ -513,6 +523,7 @@ bool ReadCaptureFile(const std::wstring& path, size_t maxPackets, CaptureResult&
     if (read && partial && out.warning.empty()) {
         out.warning = "Only part of the file could be read.";
     }
+    assert(read || !error.empty());   // a refusal always says why
     return read;
 }
 

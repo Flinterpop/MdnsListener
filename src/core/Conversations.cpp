@@ -15,10 +15,13 @@ void AddDistinct(std::vector<std::string>& list, const std::string& name)
     if (std::find(list.begin(), list.end(), name) == list.end()) {
         list.push_back(name);
     }
+    assert(list.size() <= ConversationTable::kMaxNames);
 }
 
 void FoldResponse(Conversation& conv, const Message& msg)
 {
+    assert(msg.IsResponse());
+    assert(msg.records.size() <= kMaxRecords);   // Decode's cap bounds the loop
     for (const Record& r : msg.records) {
         if (r.section == Section::Authority) {
             continue;   // probe tiebreak data, not a claim
@@ -82,6 +85,7 @@ int ConversationTable::Add(const std::string& address, uint16_t port, const Mess
 
 void ConversationTable::Clear()
 {
+    assert(items_.size() == index_.size());   // the table's invariant, checked before it is reset
     items_.clear();
     index_.clear();
     assert(items_.empty() && index_.empty());
@@ -89,6 +93,7 @@ void ConversationTable::Clear()
 
 std::string JoinNames(const std::vector<std::string>& names)
 {
+    assert(names.size() <= ConversationTable::kMaxNames);   // a conversation's list, capped by AddDistinct
     std::string s;
     for (const std::string& n : names) {
         if (!s.empty()) {
@@ -99,6 +104,7 @@ std::string JoinNames(const std::vector<std::string>& names)
     if (names.size() >= ConversationTable::kMaxNames) {
         s += ", ...";
     }
+    assert(s.empty() == names.empty());   // AddDistinct never stores an empty name
     return s;
 }
 
